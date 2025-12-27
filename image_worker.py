@@ -159,14 +159,6 @@ def process_redis(payload: dict):
         print("❌ File not found after normalization")
         return
 
-    # -----------------------------
-    # LOAD MEDIA ONCE ✅
-    # -----------------------------
-    media = load_media(file_path)
-
-    if media is None:
-        print("❌ Unsupported media type")
-        return
 
 
     # -----------------------------
@@ -176,15 +168,77 @@ def process_redis(payload: dict):
     das_detected = False
     minor_detected = False
     personal_info_detected = False
-    nsfw_detected = False
+    nsfw_detected = None
     violence_detected = False
     weapon_detected = False
 
 
+
+    # =====================================================
+    # 1️⃣ MINOR DETECTION
+    # =====================================================
+    try:
+        print("🔍 Checking for minors...")
+        minor_detected = is_minor(file_path)
+    except Exception as e:
+        print("Minor error:", e)
+
+    if minor_detected:
+        if nsfw_detected is None:
+            try:
+                print("🔍 Minor detected → checking NSFW...")
+                nsfw_detected = is_nsfw(file_path)
+            except Exception as e:
+                print("NSFW error:", e)
+
+        if nsfw_detected:
+            print("⛔ Minor + NSFW → STOP")
+            success, status = dynamic_update(
+                payload=payload,
+                minor_detected=minor_detected,
+                nsfw_detected=nsfw_detected
+            )
+            print("✅ Detection complete.")
+            print(f"   Minor Detected: {minor_detected}")
+            print(f"   NSFW Detected: {nsfw_detected}")
+            print("💾 DB Update:", status if success else f"FAILED ({status})")
+            return
+
+    # =====================================================
+    # 2️⃣ PERSONAL INFO DETECTION
+    # =====================================================
+    try:
+        print("🔍 Checking for personal info...")
+        personal_info_detected = detect_personal_info(file_path)
+    except Exception as e:
+        print("PII error:", e)
+
+    if personal_info_detected:
+        print("⛔ Personal info detected → STOP")
+        success, status = dynamic_update(
+            payload=payload,
+            personal_info_detected=personal_info_detected
+        )
+        print("✅ Detection complete.")
+        print(f"   Personal Info Detected: {personal_info_detected}")
+        print(f"   NSFW Detected: {nsfw_detected}")
+        print("💾 DB Update:", status if success else f"FAILED ({status})")
+        return
+
+    # =====================================================
+    # 3️⃣ MERGED OWL DETECTION
+    # =====================================================
+    print("🔍 Running merged OWL detection...")
+
     # -----------------------------
-    # MERGED OWL DETECTION (🔥)
+    # LOAD MEDIA ONCE ✅
     # -----------------------------
-    print("🔍 Running merged OWL moderation...")
+    media = load_media(file_path)
+
+    if media is None:
+        print("❌ Unsupported media type")
+        return
+    
     merged = run_merged_detection(
         media,
         owl_model,
@@ -196,36 +250,51 @@ def process_redis(payload: dict):
     das_detected = merged["das"]
     weapon_detected = merged["weapon"]
 
-    # nsfw
-    try:
-        print("🔍 Checking for NSFW...")
-        nsfw_detected = is_nsfw(file_path)
-    except Exception as e:
-        print("NSFW error:", e)
+    if animal_detected:
+        print("🔍 Animal detected → checking NSFW...")
+        if nsfw_detected is None:
+            try:
+                print("🔍 Animal detected → checking NSFW...")
+                nsfw_detected = is_nsfw(file_path)
+            except Exception as e:
+                print("NSFW error:", e)
 
-    # 👶 Minor
-    try:
-        print("🔍 Checking for minors...")
-        minor_detected = is_minor(file_path)
-    except Exception as e:
-        print("Minor error:", e)
+        if nsfw_detected:
+            print("⛔ Animal + NSFW → STOP")
+            success, status = dynamic_update(
+                payload=payload,
+                animal_detected=animal_detected,
+                das_detected=das_detected,
+                weapon_detected=weapon_detected,
+                nsfw_detected=nsfw_detected
+            )
+            print("✅ Detection complete.")
+            print(f"   Animal Detected: {animal_detected}")
+            print(f"   DAS Detected: {das_detected}")
+            print(f"   Weapon Detected: {weapon_detected}")
+            print(f"   NSFW Detected: {nsfw_detected}")
+            print("💾 DB Update:", status if success else f"FAILED ({status})")
+            return
 
-    # 📄 Personal info (OCR)
-    try:
-        print("🔍 Checking for personal info...")
-        personal_info_detected = detect_personal_info(file_path)
-    except Exception as e:
-        print("PII error:", e)
-
-    # ⚔️ Violence
+    # =====================================================
+    # 4️⃣ VIOLENCE DETECTION
+    # =====================================================
     try:
         print("🔍 Checking for violence...")
         violence_detected = is_violence_detected(file_path)
     except Exception as e:
         print("Violence error:", e)
 
-
-
+    # =====================================================
+    # ENSURE NSFW WAS AT LEAST CHECKED ONCE
+    # =====================================================
+    if nsfw_detected is None:
+        try:
+            print("🔍 Final NSFW check...")
+            nsfw_detected = is_nsfw(file_path)
+        except Exception as e:
+            print("NSFW error:", e)
+    
     print("✅ Detection complete.")   
     print(f"   Animal Detected: {animal_detected}")
     print(f"   DAS Detected: {das_detected}")
@@ -235,6 +304,11 @@ def process_redis(payload: dict):
     print(f"   Violence Detected: {violence_detected}")
     print(f"   Weapon Detected: {weapon_detected}") 
 
+
+# =====================================================
+    # FINAL DB UPDATE (FULL STATE)
+    # =====================================================
+    print("⌛ Updating DB")
     # -----------------------------
     # DB UPDATE (UPDATE-ONLY)
     # -----------------------------

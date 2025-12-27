@@ -3,7 +3,6 @@ import cv2
 import redis
 import time
 import json
-import numpy as np
 from pathlib import Path
 from PIL import Image
 
@@ -13,6 +12,7 @@ from merged_owlvit_detector import run_merged_detection
 from face_detect.minor_detect import is_minor
 from meetup_detect.personal_details_detect import detect_personal_info
 from violance_detect.violation_detect import is_violence_detected
+from nsfw.nsfw_detector import is_nsfw
 
 from dynamic_update import dynamic_update
 from config import REDIS_HOST, REDIS_PORT, REDIS_DB, INPUT_QUEUE, REDIS_BRPOP_TIMEOUT
@@ -80,20 +80,7 @@ VIDEO_EXT = {".mp4", ".avi", ".mov", ".mkv"}
 
 
 # =====================================================
-# IMAGE DETECTION
-# =====================================================
-def run_image_detection(image: Image.Image):
-    print("[IMAGE] Running OWL on image")
-    return run_merged_detection(
-        image,
-        owl_model,
-        owl_processor,
-        DEVICE
-    )
-
-
-# =====================================================
-# STAGE 1: CHEAP KEYFRAME EXTRACTION
+# KEYFRAME EXTRACTION
 # =====================================================
 def extract_candidate_frames(
     video_path: str,
@@ -144,8 +131,9 @@ def extract_candidate_frames(
     return candidates[:max_frames]
 
 
+
 # =====================================================
-# STAGE 2 + 3: OWL WITH VOTING
+# VIDEO OWL WITH VOTING
 # =====================================================
 def run_video_with_voting(
     video_path: str,
@@ -206,94 +194,198 @@ def run_video_with_voting(
     print("[VIDEO] OWL voting completed")
     return label_final
 
-
 # =====================================================
 # PROCESS REDIS MESSAGE
 # =====================================================
 def process_redis(payload: dict):
-    print("[WORKER] Processing new Redis payload")
+    print("\n[WORKER] New moderation task")
 
     payload["table_name"] = payload.get("table")
     payload["primary_key"] = "id"
     payload["key_value"] = payload.get("id")
 
-    data = payload.get("data", {})
-    payload["file_path"] = data.get("file")
-
-    if not payload["file_path"]:
-        print("[WORKER] No file path found, skipping")
+    file_rel = payload.get("data", {}).get("file")
+    if not file_rel:
+        print("[SKIP] No file path")
         return
 
-    file_path = normalize_file_path(payload["file_path"])
+    file_path = normalize_file_path(file_rel)
     if not os.path.exists(file_path):
-        print("[WORKER] File does not exist, skipping")
+        print("[SKIP] File not found:", file_path)
         return
 
     ext = Path(file_path).suffix.lower()
-    print(f"[WORKER] Detected file type: {ext}")
+    print("[FILE]", file_path)
 
-    if ext in IMAGE_EXT:
-        print("[WORKER] Image detected")
-        image = Image.open(file_path).convert("RGB")
-        merged = run_image_detection(image)
+    # -----------------------------
+    # FLAGS
+    # -----------------------------
+    animal_detected = False
+    das_detected = False
+    weapon_detected = False
+    minor_detected = False
+    personal_info_detected = False
+    violence_detected = False
+    nsfw_detected = None   # lazy
 
-    elif ext in VIDEO_EXT:
-        print("[WORKER] Video detected")
-        merged = run_video_with_voting(file_path)
-
-    else:
-        print("[WORKER] Unsupported file type")
-        return
-
-    print("[WORKER] Running auxiliary detectors")
-
+    # =====================================================
+    # 1️⃣ MINOR
+    # =====================================================
     try:
         minor_detected = is_minor(file_path)
-        print(f"[AUX] Minor detected: {minor_detected}")
-    except:
-        minor_detected = False
+        print("[CHECK] Minor:", minor_detected)
+    except Exception as e:
+        print("[ERROR] Minor:", e)
 
+    if minor_detected:
+        if nsfw_detected is None:
+            nsfw_detected = is_nsfw(file_path)
+            print("[CHECK] NSFW (minor):", nsfw_detected)
+
+        if nsfw_detected:
+            print("[STOP] Child + NSFW")
+            print("[DB DATA]", {
+                "minor_detected": minor_detected,
+                "nsfw_detected": nsfw_detected
+            })
+
+            success, status = dynamic_update(
+                payload=payload,
+                minor_detected=minor_detected,
+                nsfw_detected=nsfw_detected
+            )
+
+            print("[DB RESULT]", status if success else f"FAILED ({status})")
+            return
+
+
+    # =====================================================
+    # 2️⃣ PII
+    # =====================================================
     try:
         personal_info_detected = detect_personal_info(file_path)
-        print(f"[AUX] PII detected: {personal_info_detected}")
-    except:
-        personal_info_detected = False
+        print("[CHECK] PII:", personal_info_detected)
+    except Exception as e:
+        print("[ERROR] PII:", e)
 
+    if personal_info_detected:
+        print("[STOP] Personal Info")
+        print("[DB DATA]", {
+            "personal_info_detected": personal_info_detected
+        })
+
+        success, status = dynamic_update(
+            payload=payload,
+            personal_info_detected=personal_info_detected
+        )
+
+        print("[DB RESULT]", status if success else f"FAILED ({status})")
+        return
+
+
+    # =====================================================
+    # 3️⃣ OWL (VIDEO)
+    # =====================================================
+    if ext in VIDEO_EXT:
+        merged = run_video_with_voting(file_path)
+    else:
+        print("[SKIP] Unsupported type")
+        return
+
+    animal_detected = merged["animal"]
+    das_detected = merged["das"]
+    weapon_detected = merged["weapon"]
+
+    print("[OWL RESULT]", {
+        "animal": animal_detected,
+        "das": das_detected,
+        "weapon": weapon_detected
+    })
+
+
+    # =====================================================
+    # 3️⃣a ANIMAL + NSFW
+    # =====================================================
+    if animal_detected:
+        if nsfw_detected is None:
+            nsfw_detected = is_nsfw(file_path)
+            print("[CHECK] NSFW (animal):", nsfw_detected)
+
+        if nsfw_detected:
+            print("[STOP] Animal + NSFW")
+            print("[DB DATA]", {
+                "animal_detected": animal_detected,
+                "das_detected": das_detected,
+                "weapon_detected": weapon_detected,
+                "nsfw_detected": nsfw_detected
+            })
+
+            success, status = dynamic_update(
+                payload=payload,
+                animal_detected=animal_detected,
+                das_detected=das_detected,
+                weapon_detected=weapon_detected,
+                nsfw_detected=nsfw_detected
+            )
+
+            print("[DB RESULT]", status if success else f"FAILED ({status})")
+            return
+
+
+    # =====================================================
+    # 4️⃣ VIOLENCE
+    # =====================================================
     try:
         violence_detected = is_violence_detected(file_path)
-        print(f"[AUX] Violence detected: {violence_detected}")
-    except:
-        violence_detected = False
+        print("[CHECK] Violence:", violence_detected)
+    except Exception as e:
+        print("[ERROR] Violence:", e)
+        
 
-    print("[DB] Updating database")
+    # =====================================================
+    # 4️⃣ NSFW FINAL CHECK
+    # =====================================================
+    if nsfw_detected is None:
+        try:
+            print("🔍 Final NSFW check...")
+            nsfw_detected = is_nsfw(file_path)
+        except Exception as e:
+            print("NSFW error:", e)   
+
+    # =====================================================
+    # FINAL UPDATE
+    # =====================================================
+    print("[FINAL] Saving results")
+    print("✅ Detection complete.")   
+    print(f"   Animal Detected: {animal_detected}")
+    print(f"   DAS Detected: {das_detected}")
+    print(f"   Minor Detected: {minor_detected}")
+    print(f"   Personal Info Detected: {personal_info_detected}")
+    print(f"   NSFW Detected: {nsfw_detected}")
+    print(f"   Violence Detected: {violence_detected}")
+    print(f"   Weapon Detected: {weapon_detected}") 
 
     success, status = dynamic_update(
         payload=payload,
-        animal_detected=merged.get("animal", False),
-        das_detected=merged.get("das", False),
+        animal_detected=animal_detected,
+        das_detected=das_detected,
+        weapon_detected=weapon_detected,
         minor_detected=minor_detected,
         personal_info_detected=personal_info_detected,
-        nsfw_detected=merged.get("nsfw", False),
-        violence_detected=violence_detected,
-        weapon_detected=merged.get("weapon", False)
+        nsfw_detected=nsfw_detected if nsfw_detected else False,
+        violence_detected=violence_detected
     )
 
-    print(f"[DB] Update result: {status if success else 'FAILED'}")
-    print("Animal Detected:", merged.get("animal", False))
-    print("DAS Detected:", merged.get("das", False))
-    print("Minor Detected:", minor_detected)
-    print("Personal Info Detected:", personal_info_detected)
-    print("NSFW Detected:", merged.get("nsfw", False))
-    print("Violence Detected:", violence_detected)
-    print("Weapon Detected:", merged.get("weapon", False))
+    print("[DB RESULT]", status if success else f"FAILED ({status})")
+    print("[DONE] Moderation completed")
 
 
 # =====================================================
 # WORKER LOOP
 # =====================================================
 def worker():
-    print("[WORKER] Media Moderation Worker started")
-    print(f"[WORKER] Listening on queue: {INPUT_QUEUE}")
+    print("🚀 Media Moderation Worker started")
+    print("📥 Listening on:", INPUT_QUEUE)
 
     while True:
         try:
@@ -303,16 +395,21 @@ def worker():
                 continue
 
             _, message = item
-            payload = json.loads(message)
+
+            try:
+                payload = json.loads(message)
+            except json.JSONDecodeError:
+                print("⚠️ Invalid JSON")
+                continue
+
             process_redis(payload)
 
         except Exception as e:
-            print("[ERROR] Worker error:", e)
+            print("❌ Worker error:", e)
             time.sleep(1)
 
-
-# =====================================================
+# -----------------------------
 # ENTRY
-# =====================================================
+# -----------------------------
 if __name__ == "__main__":
     worker()
